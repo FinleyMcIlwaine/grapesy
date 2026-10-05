@@ -4,7 +4,7 @@
 
 -- | Client cancellation (RST_STREAM)
 --
--- Four very similar tests: in each, a client initiates a request and exchanges a message
+-- Six very similar tests: in each, a client initiates a request and exchanges a message
 -- with a server handler. The server handler then starts messages to the client
 -- indefinitely, until it is cancelled. Variations along two different axes:
 --
@@ -12,6 +12,8 @@
 --   leaves the client in half-closed state.
 -- * The client terminates the scope from withRPC normally or with an exception;
 --   this affects whether we send a RST_STREAM with CANCEL or INTERNAL_ERROR.
+--   The exception can also be asynchronous, as when the thread making the call
+--   is killed (by @timeout@, @cancel@, etc.).
 --
 -- We also verify that the server handler is eventually cancelled; that is, that
 -- is does not block indefinitely when it tries to send a message that a client
@@ -21,6 +23,9 @@
 --
 -- * <https://github.com/well-typed/grapesy/issues/349>
 -- * HTTP2 PR
+-- * <https://github.com/kazu-yamamoto/http2/pull/214>: when the exception was
+--   asynchronous, @http2@ used to close the entire connection instead of
+--   sending RST_STREAM.
 module Test.Sanity.Cancellation (tests) where
 
 import Control.Concurrent
@@ -61,6 +66,16 @@ tests = testGroup "Test.Sanity.Cancellation" [
               Client.sendFinalInput
               (throwIO $ DeliberateClientException 1)
         ]
+    , testGroup "withAsyncException" [
+          testCase "beforeHalfClosed" $
+            testReset
+              Client.sendNextInput
+              (killThread =<< myThreadId)
+        , testCase "afterHalfClosed" $
+            testReset
+              Client.sendFinalInput
+              (killThread =<< myThreadId)
+        ]
     ]
 
 {-------------------------------------------------------------------------------
@@ -73,7 +88,7 @@ testReset ::
      -- ('sendNextInput', 'sendFinalInput')
   -> IO ()
      -- ^ How should the client exit the scope of 'withRPC'?
-     -- (@return ()@, @throwIO@)
+     -- (@return ()@, @throwIO@, @killThread@)
   -> Assertion
 testReset sendInput leaveScope = do
     resultVar <- newEmptyMVar
@@ -141,7 +156,8 @@ handleEchoUntilCancelled resultVar = Server.mkRpcHandler $ \call -> do
 
 -- | Check client-side exception
 --
--- We expected 'GrpcCancelled' unless the client threw an exception itself.
+-- We expected 'GrpcCancelled' unless the client threw an exception itself
+-- (or was killed).
 checkClientException :: IO () -> IO ()
 checkClientException client = do
     clientResult :: Either ExactException () <- E.try client
@@ -153,6 +169,9 @@ checkClientException client = do
              , grpcError e' == GrpcCancelled ->
         return ()
       Left e | Just DeliberateClientException{}
+                 <- E.fromException (unwrapExactException e) ->
+        return ()
+      Left e | Just E.ThreadKilled
                  <- E.fromException (unwrapExactException e) ->
         return ()
       _otherwise ->

@@ -4,6 +4,7 @@
 
 module Test.Sanity.StreamingType.NonStreaming (tests) where
 
+import Control.Concurrent (threadDelay)
 import Data.Word
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -135,6 +136,18 @@ tests = testGroup "Test.Sanity.StreamingType.NonStreaming" [
                       }
                 ]
             ]
+        , testGroup "slowServer" [
+              -- The server takes longer to respond than the 30 second idle
+              -- timeout that client connections used to have (from
+              -- @allocSimpleConfig@ in @http2@ for insecure connections, and
+              -- @allocConfigForClient@ in @http2-tls@ for secure ones).
+              testCase "insecure" $
+                test_incrementAfter 35 def
+            , testCase "secure" $
+                test_incrementAfter 35 def {
+                    useTLS = Just $ TlsOk TlsOkCertAsRoot
+                  }
+            ]
         ]
     ]
 
@@ -149,7 +162,14 @@ type instance ResponseInitialMetadata  BinaryIncrement = NoMetadata
 type instance ResponseTrailingMetadata BinaryIncrement = NoMetadata
 
 test_increment :: ClientServerConfig -> IO ()
-test_increment config = testClientServer $ ClientServerTest {
+test_increment = test_incrementAfter 0
+
+-- | Variation on 'test_increment' where the server takes a while to respond
+test_incrementAfter ::
+     Int -- ^ How long the server waits before responding (in seconds)
+  -> ClientServerConfig
+  -> IO ()
+test_incrementAfter delay config = testClientServer $ ClientServerTest {
       config
     , client = simpleTestClient $ \conn -> do
         Client.withRPC conn def (Proxy @BinaryIncrement) $ \call -> do
@@ -157,7 +177,8 @@ test_increment config = testClientServer $ ClientServerTest {
           resp <- fst <$> Binary.recvFinalOutput @Word8 call
           assertEqual "" 2 $ resp
     , server = [
-         Server.fromMethod @BinaryIncrement $ Binary.mkNonStreaming $ \n ->
+         Server.fromMethod @BinaryIncrement $ Binary.mkNonStreaming $ \n -> do
+           threadDelay (delay * 1_000_000)
            return (succ (n :: Word8))
         ]
     }
