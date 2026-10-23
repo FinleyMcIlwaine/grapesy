@@ -4,7 +4,7 @@
 
 -- | Client cancellation (RST_STREAM)
 --
--- Four very similar tests: in each, a client initiates a request and exchanges a message
+-- Six very similar tests: in each, a client initiates a request and exchanges a message
 -- with a server handler. The server handler then starts messages to the client
 -- indefinitely, until it is cancelled. Variations along two different axes:
 --
@@ -61,6 +61,16 @@ tests = testGroup "Test.Sanity.Cancellation" [
               Client.sendFinalInput
               (throwIO $ DeliberateClientException 1)
         ]
+    , testGroup "killed" [
+          testCase "beforeHalfClosed" $
+            testReset
+              Client.sendNextInput
+              (killThread =<< myThreadId)
+        , testCase "afterHalfClosed" $
+            testReset
+              Client.sendFinalInput
+              (killThread =<< myThreadId)
+        ]
     ]
 
 {-------------------------------------------------------------------------------
@@ -73,7 +83,7 @@ testReset ::
      -- ('sendNextInput', 'sendFinalInput')
   -> IO ()
      -- ^ How should the client exit the scope of 'withRPC'?
-     -- (@return ()@, @throwIO@)
+     -- (@return ()@, @throwIO@, @killThread@)
   -> Assertion
 testReset sendInput leaveScope = do
     resultVar <- newEmptyMVar
@@ -153,6 +163,9 @@ checkClientException client = do
              , grpcError e' == GrpcCancelled ->
         return ()
       Left e | Just DeliberateClientException{}
+                 <- E.fromException (unwrapExactException e) ->
+        return ()
+      Left e | Just E.ThreadKilled
                  <- E.fromException (unwrapExactException e) ->
         return ()
       _otherwise ->

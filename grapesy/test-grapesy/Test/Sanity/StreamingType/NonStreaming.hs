@@ -4,6 +4,7 @@
 
 module Test.Sanity.StreamingType.NonStreaming (tests) where
 
+import Control.Concurrent
 import Data.Word
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -135,8 +136,19 @@ tests = testGroup "Test.Sanity.StreamingType.NonStreaming" [
                       }
                 ]
             ]
+        , testGroup "silentServer" [
+              testCase "default" $
+                test_incrementAfter silence def
+            , testCase "TLS" $
+                test_incrementAfter silence def {
+                    useTLS = Just $ TlsOk TlsOkCertAsRoot
+                  }
+            ]
         ]
     ]
+  where
+    silence :: Int
+    silence = 35_000_000
 
 {-------------------------------------------------------------------------------
   Binary (without Protobuf)
@@ -149,7 +161,10 @@ type instance ResponseInitialMetadata  BinaryIncrement = NoMetadata
 type instance ResponseTrailingMetadata BinaryIncrement = NoMetadata
 
 test_increment :: ClientServerConfig -> IO ()
-test_increment config = testClientServer $ ClientServerTest {
+test_increment = test_incrementAfter 0
+
+test_incrementAfter :: Int -> ClientServerConfig -> IO ()
+test_incrementAfter delay config = testClientServer $ ClientServerTest {
       config
     , client = simpleTestClient $ \conn -> do
         Client.withRPC conn def (Proxy @BinaryIncrement) $ \call -> do
@@ -157,7 +172,8 @@ test_increment config = testClientServer $ ClientServerTest {
           resp <- fst <$> Binary.recvFinalOutput @Word8 call
           assertEqual "" 2 $ resp
     , server = [
-         Server.fromMethod @BinaryIncrement $ Binary.mkNonStreaming $ \n ->
+         Server.fromMethod @BinaryIncrement $ Binary.mkNonStreaming $ \n -> do
+           threadDelay delay
            return (succ (n :: Word8))
         ]
     }
