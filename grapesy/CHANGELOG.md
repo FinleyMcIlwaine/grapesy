@@ -1,5 +1,13 @@
 # Revision history for grapesy
 
+## Unreleased
+
+* Bump `http2` to 5.4.9 and `http2-tls` to 0.5.5
+* Killing the thread that makes a call (`timeout`, `cancel`, ..) resets only
+  that stream, rather than closing the connection and every other call on it
+* Client connections no longer close after 30 seconds without frames from the
+  server
+
 ## 1.2.1 -- 2026-09-29
 
 * Bump `http2` to 5.4.6

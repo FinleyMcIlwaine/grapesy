@@ -274,7 +274,7 @@ connectInsecure connParams attempt addr = do
 -- | Insecure connection over the given socket
 connectSocket :: ConnParams -> Attempt -> String -> Socket -> IO ()
 connectSocket connParams attempt connAuthority sock = do
-    bracket (HTTP2.Client.allocSimpleConfig sock writeBufferSize)
+    bracket (HTTP2.Client.allocSimpleConfig' sock writeBufferSize 0)
             HTTP2.Client.freeSimpleConfig $ \conf ->
       HTTP2.Client.run clientConfig conf $ \sendRequest _aux -> do
         let conn = Session.ConnectionToServer sendRequest
