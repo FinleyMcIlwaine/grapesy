@@ -16,12 +16,15 @@ module Test.Util.FrameLevelServer (
     -- * Scripts
   , Script -- opaque
   , withScript
+  , withSecureScript
     -- ** Primitives
   , recv
   , ignore
   , send
+  , hangUp
     -- ** Standard building blocks
   , handshake
+  , recvRequestHeaders
   , recvUntilEndStream
   , defaultNoiseFilter
   ) where
@@ -40,9 +43,11 @@ import Data.Binary.Put qualified as Binary
 import Data.Bits
 import Data.ByteString qualified as BS.Strict
 import Data.ByteString qualified as Strict (ByteString)
+import Data.ByteString.Char8 qualified as BS.Strict.Char8
 import Data.ByteString.Lazy qualified as BS.Lazy
 import Data.ByteString.Lazy qualified as Lazy (ByteString)
 import Data.Either (partitionEithers)
+import Data.IORef
 import Data.Kind
 import Data.List.NonEmpty qualified as NE
 import Data.Maybe (catMaybes)
@@ -51,13 +56,17 @@ import Data.Word
 import Network.GRPC.Client qualified as Client
 import Network.Socket
 import Network.Socket.ByteString qualified as Socket
+import Network.TLS qualified as TLS
 import System.IO (fixIO)
 
 #if MIN_VERSION_base(4,20,0)
 import Control.Exception.Annotation
 #endif
 
+import Network.GRPC.Common (SslKeyLog (..))
 import Network.GRPC.Common.Exception
+
+import Paths_ (getDataFileName)
 
 {-------------------------------------------------------------------------------
   Scripts
@@ -67,6 +76,7 @@ data Script :: Type -> Type where
   Recv   :: (Frame -> Either String a) -> (a -> Script b) -> Script b
   Ignore :: (Frame -> Bool) -> Script a -> Script a
   Send   :: Frame -> Script a -> Script a
+  HangUp :: Script a -> Script a
   Done   :: a -> Script a
 
 -- | Receive frame of specified shape, or fail on unexpected frames
@@ -81,6 +91,9 @@ ignore p = Ignore p $ Done ()
 send :: Frame -> Script ()
 send f = Send f $ Done ()
 
+hangUp :: Script ()
+hangUp = HangUp $ Done ()
+
 instance Functor Script where
   fmap = liftM
 
@@ -92,6 +105,7 @@ instance Monad Script where
   Recv   p k >>= l = Recv   p (k >=> l)
   Ignore p k >>= l = Ignore p (k >>= l)
   Send   f k >>= l = Send   f (k >>= l)
+  HangUp   k >>= l = HangUp   (k >>= l)
   Done x     >>= l = l x
 
 withScript :: forall a r.
@@ -99,24 +113,50 @@ withScript :: forall a r.
   -> Script a
   -> (Client.Server -> GetHandlerResults a -> IO r)
   -> IO r
-withScript service script k =
-    withServer service handler $ \_host port getHandlerResults -> do
-      let server :: Client.Server
-          server = Client.ServerInsecure $ Client.Address{
+withScript service =
+    withScriptOver service (return . socketTransport) Client.ServerInsecure
+
+-- | Throws 'IOError' if the demo certificate or key cannot be loaded.
+withSecureScript :: forall a r.
+     Script a
+  -> (Client.Server -> GetHandlerResults a -> IO r)
+  -> IO r
+withSecureScript script k = do
+    pubCert <- getDataFileName "grapesy" "grpc-demo.pem"
+    privKey <- getDataFileName "grapesy" "grpc-demo.key"
+    cred    <- either fail return =<< TLS.credentialLoadX509 pubCert privKey
+    withScriptOver
+      Nothing
+      (tlsTransport $ tlsServerParams cred)
+      (Client.ServerSecure Client.NoServerValidation SslKeyLogNone)
+      script
+      k
+
+withScriptOver :: forall a r.
+     Maybe ServiceName
+  -> (Socket -> IO Transport)
+  -> (Client.Address -> Client.Server)
+  -> Script a
+  -> (Client.Server -> GetHandlerResults a -> IO r)
+  -> IO r
+withScriptOver service mkTransport mkServer script k =
+    withServer service handler $ \_host port getHandlerResults ->
+      k (mkServer Client.Address{
               addressHost      = "127.0.0.1"
             , addressPort      = port
             , addressAuthority = Nothing
-            }
-      k server getHandlerResults
+            })
+        getHandlerResults
   where
     handler :: ServerHandler a
-    handler clientSock clientAddr = do
-        consumePreface clientSock
-        runScript clientSock clientAddr script
+    handler clientSock _clientAddr = do
+        transport <- mkTransport clientSock
+        consumePreface transport
+        runScript transport script
 
-    consumePreface :: Socket -> IO ()
-    consumePreface clientSock = do
-        mPreface <- fmap BS.Lazy.unpack <$> recvExact clientSock 24
+    consumePreface :: Transport -> IO ()
+    consumePreface transport = do
+        mPreface <- fmap BS.Lazy.unpack <$> recvExact transport 24
         unless (mPreface == Just preface) $
           fail $ "Expected preface, got " ++ show mPreface
 
@@ -128,13 +168,13 @@ withScript service script k =
         , 0x53, 0x4d, 0x0d, 0x0a, 0x0d, 0x0a
         ]
 
-runScript :: Socket -> SockAddr -> Script a -> IO a
-runScript clientSock _clientAddr = go (const False)
+runScript :: Transport -> Script a -> IO a
+runScript transport = go (const False)
   where
     go :: (Frame -> Bool) -> Script a -> IO a
     go noiseFilter = \case
         Recv p k -> do
-          mFrame <- recvFrame clientSock
+          mFrame <- recvFrame transport
           case mFrame of
             Nothing ->
               fail "Unexpected EOF"
@@ -147,15 +187,18 @@ runScript clientSock _clientAddr = go (const False)
         Ignore p k -> do
           go p k
         Send f k -> do
-          sendFrame clientSock f
+          sendFrame transport f
           go noiseFilter k
+        HangUp k -> do
+          transportHangUp transport
+          go (const True) k
         Done a -> do
           skipRemainder noiseFilter
           return a
 
     skipRemainder :: (Frame -> Bool) -> IO ()
     skipRemainder noiseFilter = do
-        mFrame <- recvFrame clientSock
+        mFrame <- recvFrame transport
         case mFrame of
           Nothing ->
             return ()
@@ -211,6 +254,13 @@ handshake = do
         _otherwise -> Left $ "Expected client SETTINGS, got " ++ show frame
     send $ Frame (FrameHeader 0 0x4 0x1 0) BS.Lazy.empty   -- ACK theirs
     ignore defaultNoiseFilter
+
+recvRequestHeaders :: Word32 -> Script ()
+recvRequestHeaders sid = recv $ \frame ->
+    case frameHeader frame of
+      FrameHeader{frameType = 0x1, frameStreamId}
+        | frameStreamId == sid -> Right ()
+      _otherwise -> Left $ "Expected HEADERS on stream " ++ show sid ++ ", got " ++ show frame
 
 -- | Receive DATA frames on the given stream, up to and including END_STREAM
 --
@@ -318,13 +368,13 @@ instance Binary FrameHeader where
         , frameStreamId
         } = header
 
-recvFrame :: Socket -> IO (Maybe Frame)
-recvFrame sock = do
-    mHeader <- recvBinary sock 9
+recvFrame :: Transport -> IO (Maybe Frame)
+recvFrame transport = do
+    mHeader <- recvBinary transport 9
     case mHeader of
       Nothing     -> return Nothing
       Just header -> do
-        mPayload <- recvExact sock (fromIntegral $ frameLength header)
+        mPayload <- recvExact transport (fromIntegral $ frameLength header)
         case mPayload of
           Nothing      -> fail "Missing payload"
           Just payload -> return $ Just Frame{
@@ -332,10 +382,10 @@ recvFrame sock = do
             , framePayload = payload
             }
 
-sendFrame :: Socket -> Frame -> IO ()
-sendFrame sock Frame{frameHeader, framePayload} = do
-    sendBinary sock frameHeader
-    Socket.sendMany sock $ BS.Lazy.toChunks framePayload
+sendFrame :: Transport -> Frame -> IO ()
+sendFrame transport Frame{frameHeader, framePayload} = do
+    sendBinary transport frameHeader
+    transportSend transport $ BS.Lazy.toChunks framePayload
 
 {-------------------------------------------------------------------------------
   Server
@@ -444,13 +494,56 @@ runServer host service serverState handler = do
   Internal auxiliary: network
 -------------------------------------------------------------------------------}
 
-recvExact :: Socket -> Int -> IO (Maybe Lazy.ByteString)
-recvExact sock = \n -> go n []
+data Transport = Transport {
+      transportRecv   :: Int -> IO Strict.ByteString
+    , transportSend   :: [Strict.ByteString] -> IO ()
+    , transportHangUp :: IO ()
+    }
+
+socketTransport :: Socket -> Transport
+socketTransport sock = Transport {
+      transportRecv   = Socket.recv sock
+    , transportSend   = Socket.sendMany sock
+    , transportHangUp = shutdown sock ShutdownSend
+    }
+
+-- | Throws 'TLS.TLSException' if the handshake with the client fails.
+tlsTransport :: TLS.ServerParams -> Socket -> IO Transport
+tlsTransport params sock = do
+    ctx      <- TLS.contextNew sock params
+    TLS.handshake ctx
+    leftover <- newIORef BS.Strict.empty
+    return Transport {
+        transportRecv = \n -> do
+          buffered <- readIORef leftover
+          chunk    <- if BS.Strict.null buffered
+                        then TLS.recvData ctx
+                        else return buffered
+          let (now, later) = BS.Strict.splitAt n chunk
+          writeIORef leftover later
+          return now
+      , transportSend   = TLS.sendData ctx . BS.Lazy.fromChunks
+      , transportHangUp = shutdown sock ShutdownSend
+      }
+
+tlsServerParams :: TLS.Credential -> TLS.ServerParams
+tlsServerParams cred = TLS.defaultParamsServer {
+      TLS.serverShared = (TLS.serverShared TLS.defaultParamsServer) {
+          TLS.sharedCredentials = TLS.Credentials [cred]
+        }
+    , TLS.serverHooks = (TLS.serverHooks TLS.defaultParamsServer) {
+          TLS.onALPNClientSuggest = Just $ \_ ->
+            return $ BS.Strict.Char8.pack "h2"
+        }
+    }
+
+recvExact :: Transport -> Int -> IO (Maybe Lazy.ByteString)
+recvExact transport = \n -> go n []
   where
     go :: Int -> [Strict.ByteString] -> IO (Maybe Lazy.ByteString)
     go 0 acc = return $ Just $ BS.Lazy.fromChunks (reverse acc)
     go n acc = do
-        chunk <- Socket.recv sock (min n 4096)
+        chunk <- transportRecv transport (min n 4096)
         if BS.Strict.null chunk then
           case acc of
             [] -> return Nothing
@@ -458,9 +551,9 @@ recvExact sock = \n -> go n []
         else
           go (n - BS.Strict.length chunk) (chunk : acc)
 
-recvBinary :: Binary a => Socket -> Int -> IO (Maybe a)
-recvBinary sock sz = do
-    mBytes <- recvExact sock sz
+recvBinary :: Binary a => Transport -> Int -> IO (Maybe a)
+recvBinary transport sz = do
+    mBytes <- recvExact transport sz
     case mBytes of
       Nothing    -> return Nothing
       Just bytes -> do
@@ -473,8 +566,8 @@ recvBinary sock sz = do
               fail $ "Unexpected size " ++ show sz' ++ ". Expected " ++ show sz
             return (Just a)
 
-sendBinary :: Binary a => Socket -> a -> IO ()
-sendBinary sock = Socket.sendMany sock . BS.Lazy.toChunks . Binary.encode
+sendBinary :: Binary a => Transport -> a -> IO ()
+sendBinary transport = transportSend transport . BS.Lazy.toChunks . Binary.encode
 
 {-------------------------------------------------------------------------------
   Internal auxiliary: async

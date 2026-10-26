@@ -156,7 +156,7 @@ ignoreRequest =
 -- | Scenario (3): respond with initial headers, then skip the request message
 respondWithHeaders :: Script ()
 respondWithHeaders = do
-    recvRequestHeaders 1
+    Frame.recvRequestHeaders 1
     Frame.send $ Frame.mkFrame 0x1 0x4 1 responseHeaders  -- END_HEADERS
     Frame.ignore $ \frame ->
          Frame.defaultNoiseFilter frame
@@ -177,13 +177,6 @@ sendTrailersOnlyTwoFrames = do
 sendTrailers :: Script ()
 sendTrailers =
     Frame.send $ Frame.mkFrame 0x1 0x5 1 lateTrailers  -- END_STREAM | END_HEADERS
-
-recvRequestHeaders :: Word32 -> Script ()
-recvRequestHeaders sid = Frame.recv $ \frame ->
-    case frameHeader frame of
-      FrameHeader{frameType = 0x1, frameStreamId}
-        | frameStreamId == sid -> Right ()
-      _otherwise -> Left $ "Expected HEADERS on stream " ++ show sid ++ ", got " ++ show frame
 
 {-------------------------------------------------------------------------------
   Header blocks

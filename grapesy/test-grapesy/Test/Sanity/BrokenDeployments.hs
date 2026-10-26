@@ -13,6 +13,7 @@ import Data.ByteString.UTF8 qualified as BS.Strict.UTF8
 import Data.IORef
 import Data.Text qualified as Text
 import Network.HTTP.Types qualified as HTTP
+import System.Timeout (timeout)
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -23,6 +24,7 @@ import Network.GRPC.Common.Protobuf
 import Network.GRPC.Server.StreamType qualified as Server
 
 import Test.Driver.ClientServer
+import Test.Util.FrameLevelServer qualified as Frame
 import Test.Util.RawTestServer
 
 import Proto.API.Ping
@@ -58,6 +60,15 @@ tests = testGroup "Test.Sanity.BrokenDeployments" [
         ]
     , testGroup "Timeout" [
           testCase "serverIgnoresTimeout" test_serverIgnoresTimeout
+        ]
+    , testGroup "HangUp" [
+          testGroup "beforeResponse" [
+              testCase "insecure" $
+                test_hangUpBeforeResponse (Frame.withScript Nothing)
+            , testCase "secure" $
+                test_hangUpBeforeResponse Frame.withSecureScript
+            ]
+        , testCase "afterTlsHandshake" test_hangUpAfterTlsHandshake
         ]
     ]
 
@@ -426,4 +437,42 @@ test_serverIgnoresTimeout = respondWithIO (\_reqBody -> response) $ \addr -> do
           Client.callTimeout = Just $
             Client.Timeout Client.Millisecond (Client.TimeoutValue 100)
         }
+
+{-------------------------------------------------------------------------------
+  Server hangs up
+-------------------------------------------------------------------------------}
+
+test_hangUpBeforeResponse ::
+     (Frame.Script () -> (Client.Server -> IO [()] -> IO ()) -> IO ())
+  -> Assertion
+test_hangUpBeforeResponse withScript = withScript script $ \server _ -> do
+    mResp :: Either Client.ServerDisconnected (Proto PongMessage) <- try $
+      Client.withConnection connParams server $ \conn ->
+        Client.withRPC conn def (Proxy @Ping) $ \call -> do
+          Client.sendFinalInput call defMessage
+          fst <$> Client.recvFinalOutput call
+    case mResp of
+      Left _ ->
+        return ()
+      Right _ ->
+        assertFailure "Expected ServerDisconnected"
+  where
+    script :: Frame.Script ()
+    script = do
+        Frame.handshake
+        Frame.recvRequestHeaders 1
+        Frame.hangUp
+
+test_hangUpAfterTlsHandshake :: Assertion
+test_hangUpAfterTlsHandshake = Frame.withSecureScript Frame.hangUp $ \server _ -> do
+    consulted <- newEmptyMVar
+    let params :: Client.ConnParams
+        params = connParams {
+              Client.connReconnectPolicy = Client.ReconnectPolicy $ do
+                void $ tryPutMVar consulted ()
+                return Client.DontReconnect
+            }
+    mConsulted <- Client.withConnection params server $ \_ ->
+      timeout 5_000_000 $ readMVar consulted
+    assertEqual "reconnect policy consulted" (Just ()) mConsulted
 
