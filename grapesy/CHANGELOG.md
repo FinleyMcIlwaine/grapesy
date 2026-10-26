@@ -1,5 +1,13 @@
 # Revision history for grapesy
 
+## Unreleased
+
+* A TLS connection lost after its handshake is retried according to the
+  `ReconnectPolicy`, like any other lost connection. Only a failed handshake
+  still gives up on the connection
+* A call whose connection is lost before the response arrives fails with
+  `ServerDisconnected`, rather than with the raw `http2` exception
+
 ## 1.2.1 -- 2026-09-29
 
 * Bump `http2` to 5.4.6

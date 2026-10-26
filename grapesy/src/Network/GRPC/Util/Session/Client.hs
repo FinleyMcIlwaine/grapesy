@@ -9,6 +9,7 @@ module Network.GRPC.Util.Session.Client (
 import Network.GRPC.Util.Imports
 
 import Control.Concurrent.STM qualified as STM
+import Control.Exception (Handler (..), catches)
 import Data.ByteString qualified as BS.Strict
 import Data.ByteString qualified as Strict (ByteString)
 import Data.ByteString.Lazy qualified as BS.Lazy
@@ -16,6 +17,8 @@ import Data.ByteString.Lazy qualified as Lazy (ByteString)
 import Network.HTTP.Semantics qualified as HTTP
 import Network.HTTP.Semantics.Client qualified as Client
 import Network.HTTP.Types qualified as HTTP
+import Network.HTTP2.Client (HTTP2Error)
+import Network.TLS (TLSException)
 
 import Network.GRPC.Common.Exception
 import Network.GRPC.Util.ClientStream
@@ -153,6 +156,10 @@ setupRequestChannel sess conn terminateCall outboundStart = do
     forkRequest :: Channel sess -> Client.Request -> IO ()
     forkRequest channel req =
         forkThread "grapesy:clientInbound" (channelInbound channel) $ \unmask ctxt -> unmask $
+          flip catches [
+              Handler $ \(e :: HTTP2Error)   -> wrapServerDisconnected $ throwIO e
+            , Handler $ \(e :: TLSException) -> wrapServerDisconnected $ throwIO e
+            ] $
           sendRequest conn req $ \resp -> do
             responseStatus <-
               case Client.responseStatus resp of

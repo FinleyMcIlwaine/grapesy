@@ -40,7 +40,7 @@ import Network.HTTP2.TLS.Client qualified as HTTP2.TLS.Client
 import Network.Run.TCP qualified as Run
 import Network.Socket (Socket, AddrInfo, StructLinger (..), SocketOption (..), SockOptValue (..))
 import Network.Socket qualified as Socket
-import Network.TLS (TLSException)
+import Network.TLS (TLSException (HandshakeFailed))
 
 import Network.GRPC.Client.Meta qualified as Meta
 import Network.GRPC.Common.Exception
@@ -129,7 +129,7 @@ closeConnection conn = putMVar (connOutOfScope conn) ()
 
 isFatalException :: ExactException -> Bool
 isFatalException (WrapExactException err)
-  | Just (_tlsException :: TLSException) <- fromException err
+  | Just HandshakeFailed{} <- fromException err
   = True
 
   | otherwise
